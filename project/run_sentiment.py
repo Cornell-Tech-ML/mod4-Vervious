@@ -3,6 +3,8 @@ import random
 import embeddings
 
 import minitorch
+import numpy as np
+
 from datasets import load_dataset
 
 BACKEND = minitorch.TensorBackend(minitorch.FastOps)
@@ -34,8 +36,10 @@ class Conv1d(minitorch.Module):
         self.bias = RParam(1, out_channels, 1)
 
     def forward(self, input):
-        # TODO: Implement for Task 4.5.
-        raise NotImplementedError("Need to implement for Task 4.5")
+        # NOTE: Implemented for Task 4.5.
+        # batch, in_channels, width = input.shape
+        x = minitorch.conv1d(input, self.weights.value)
+        return x + self.bias.value
 
 
 class CNNSentimentKim(minitorch.Module):
@@ -61,15 +65,55 @@ class CNNSentimentKim(minitorch.Module):
     ):
         super().__init__()
         self.feature_map_size = feature_map_size
-        # TODO: Implement for Task 4.5.
-        raise NotImplementedError("Need to implement for Task 4.5")
+        self.C = 1 # binary classifier + sigmoid
+        # NOTE: could also set self.C = 2, and use softmax, as in the original paper...
+
+        # NOTE: implemented below for Task 4.5
+
+        self.dropout = dropout
+
+        # Convolutional layers
+        self.conv_layers = []
+        for fs in filter_sizes:
+            self.conv_layers.append(
+                Conv1d(in_channels=embedding_size, out_channels=feature_map_size, kernel_width=fs)
+            )
+        # logistic regression
+        self.proj = Linear(feature_map_size * len(filter_sizes), self.C)
+
 
     def forward(self, embeddings):
         """
-        embeddings tensor: [batch x sentence length x embedding dim]
+        embeddings tensor: [batch x sentence length x embedding dim (n_embd)]
         """
-        # TODO: Implement for Task 4.5.
-        raise NotImplementedError("Need to implement for Task 4.5")
+        # NOTE: Implemented for Task 4.5
+        B, n_features, n_embd = embeddings.shape[0], self.feature_map_size, embeddings.shape[2]
+
+        # n_embd maps to in_channels
+        x = embeddings.permute(0, 2, 1) # (B, n_embd, T)
+        to_concat = []
+        for conv_layer in self.conv_layers:
+            z = conv_layer.forward(x).relu() # (B, n_features, T)
+            z = minitorch.max(z, dim=2) # (B, n_features)
+
+            # Hacky concatenation code since we never had to implement
+            z = z.permute(1, 0).contiguous() # (n_features, B)
+            _storage = z._tensor._storage # B*n_features (but wraps every B)
+            to_concat.append(_storage)
+
+        # continuation of diy concat
+        _concat = np.concatenate(to_concat) #  B*n_features*3
+        x = minitorch.Tensor.make(_concat, (n_features*len(to_concat), B), backend=embeddings.backend)
+        x = x.permute(1,0).contiguous() # (B, n_features * n_filters (3) )
+
+
+        # NOTE: moved dropout up because really it makes a lot more sense...
+        x = minitorch.dropout(x, self.dropout, ignore=(self.training == False)) #  (B, n_features * n_filters (3))
+
+        y = self.proj.forward(x).sigmoid()  # (B, C) logits
+        return y.view(B)
+
+
 
 
 # Evaluation helper methods
@@ -153,7 +197,9 @@ class SentenceSentimentTrain:
                 x.requires_grad_(True)
                 y.requires_grad_(True)
                 # Forward
+                # print(y) # (B)
                 out = model.forward(x)
+
                 prob = (out * y) + (out - 1.0) * (y - 1.0)
                 loss = -(prob.log() / y.shape[0]).sum()
                 loss.view(1).backward()
@@ -258,12 +304,20 @@ if __name__ == "__main__":
     learning_rate = 0.01
     max_epochs = 250
 
+    print("Loading data...")
+    gluedataset = load_dataset("glue", "sst2")
+    print("Now getting wikipedia gigaword...")
+    emb = embeddings.GloveEmbedding("wikipedia_gigaword", d_emb=50, show_progress=True)
+    print("Done loading data")
+
+    print("Encoding data...")
     (X_train, y_train), (X_val, y_val) = encode_sentiment_data(
-        load_dataset("glue", "sst2"),
-        embeddings.GloveEmbedding("wikipedia_gigaword", d_emb=50, show_progress=True),
+        gluedataset,
+        emb,
         train_size,
         validation_size,
     )
+    print("Done encoding data")
     model_trainer = SentenceSentimentTrain(
         CNNSentimentKim(feature_map_size=100, filter_sizes=[3, 4, 5], dropout=0.25)
     )
